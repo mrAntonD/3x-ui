@@ -336,7 +336,7 @@ func (s *SubService) getInboundsBySubId(subId string) ([]*model.Inbound, error) 
 		JOIN client_inbounds ON client_inbounds.inbound_id = inbounds.id
 		JOIN clients ON clients.id = client_inbounds.client_id
 		WHERE
-			inbounds.protocol in ('vmess','vless','trojan','shadowsocks','hysteria')
+			inbounds.protocol in ('vmess','vless','trojan','shadowsocks','hysteria','wireguard')
 			AND clients.sub_id = ? AND inbounds.enable = ?
 	)`, subId, true).Order("sub_sort_index ASC").Order("id ASC").Find(&inbounds).Error
 	if err != nil {
@@ -470,7 +470,10 @@ func (s *SubService) GetLink(inbound *model.Inbound, email string) string {
 		return s.genHysteriaLink(inbound, email)
 	case "mtproto":
 		return s.genMtprotoLink(inbound, email)
+    case "wireguard": // Or model.Wireguard if defined in your model constants
+		return s.genWireguardLink(inbound, email)
 	}
+
 	return ""
 }
 
@@ -896,6 +899,70 @@ func hysteriaHopPorts(stream map[string]any) string {
 	udpHop, _ := quicParams["udpHop"].(map[string]any)
 	ports, _ := udpHop["ports"].(string)
 	return strings.TrimSpace(ports)
+}
+
+func (s *SubService) genWireguardLink(inbound *model.Inbound, email string) string {
+	if inbound.Protocol != "wireguard" {
+		return ""
+	}
+
+	// 1. Parse Inbound Settings (Server/Master Side configuration)
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(inbound.Settings), &settings); err != nil {
+		return ""
+	}
+
+	// Extract server endpoint or resolve via inbound strategy
+	address := s.resolveInboundAddress(inbound)
+	port := inbound.Port
+
+	// 2. Locate the specific peer/client by email
+	clients, _ := s.inboundService.GetClients(inbound)
+	clientIndex := findClientIndex(clients, email)
+	if clientIndex == -1 {
+		return ""
+	}
+	client := clients[clientIndex]
+
+	// 3. Build query parameters for the wg:// link
+	params := make(map[string]string)
+	
+	// Client Private Key (The client needs their private key to decrypt traffic)
+	// Note: In 3x-ui, the peer configuration block stores the client keys.
+	if privateKey, ok := client.PrivateKey.(string); ok && privateKey != "" {
+		params["privateKey"] = privateKey
+	} else if secretKey, ok := client.SecretKey.(string); ok && secretKey != "" {
+		params["privateKey"] = secretKey
+	}
+
+	// Server Public Key (So the client can encrypt handshakes to the server)
+	if serverPublicKey, ok := settings["secretKey"].(string); ok { // often stored as secretKey/publicKey in panels
+		params["publicKey"] = serverPublicKey
+	}
+
+	// Client local VPN IP allocation (e.g., 10.0.0.2/32 or fd00::2/128)
+	if localAddress, ok := client.IP.(string); ok && localAddress != "" {
+		params["ip"] = localAddress
+	}
+
+	// Optional parameters: MTU, DNS, and Reserved bytes (anti-DPI tracking)
+	if mtu, ok := settings["mtu"].(float64); ok && mtu > 0 {
+		params["mtu"] = fmt.Sprintf("%d", int(mtu))
+	}
+	
+	// Read reserved info if configured for anti-DPI security
+	if reserved, ok := client.Reserved.(string); ok && reserved != "" {
+		params["reserved"] = reserved
+	}
+
+	// 4. Construct final URI scheme: wg://<server_public_key>@<endpoint>:<port>
+	// Alternatively, some clients look for a cleaner base format: wg://endpoint?params
+	baseLink := fmt.Sprintf("wg://%s", joinHostPort(address, port))
+	
+	// Generate customized remark name tag
+	remark := s.genRemark(inbound, email, "", "wireguard")
+
+	return buildLinkWithParams(baseLink, params, remark)
 }
 
 // loadNodes refreshes nodesByID from the DB. Called once per request so
